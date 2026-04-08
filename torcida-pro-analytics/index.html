@@ -21391,7 +21391,7 @@ async function pipVerificarExistencia(slug, token, storeId) {
 //   { values: ["P"] }        → formato correto
 //   { values: ["P"], price } → completo
 //
-// Garante: sem duplicatas, sem vazios, sem option1, trim() em tudo.
+// Garante: sem duplicatas (case-insensitive), sem vazios, sem option1, trim() em tudo.
 // ══════════════════════════════════════════════════════════════════════
 function normalizarVariantesFrontend(rawVariants, preco, precoComparativo) {
   // Preço base — aceita number ou string
@@ -21408,7 +21408,19 @@ function normalizarVariantesFrontend(rawVariants, preco, precoComparativo) {
     ? rawVariants
     : ['P', 'M', 'G'];
 
-  const vistos = new Set();
+  // ── Diagnóstico: detectar duplicatas no input ─────────────────────────
+  const inputDiag = raw.map(v => {
+    if (typeof v === 'string') return v.trim();
+    if (Array.isArray(v?.values) && v.values.length > 0) return String(v.values[0] || '').trim();
+    return String(v?.value || v?.option1 || '').trim();
+  }).filter(Boolean);
+  const inputSet = new Set(inputDiag.map(s => s.toLowerCase()));
+  if (inputSet.size !== inputDiag.length) {
+    console.error('[normalizarVariantesFrontend] 🚨 Duplicatas no input:', inputDiag);
+  }
+
+  // ── Set case-insensitive para deduplicação ────────────────────────────
+  const vistos = new Set();  // armazena lowercase para comparação
   const resultado = [];
 
   for (const v of raw) {
@@ -21448,9 +21460,13 @@ function normalizarVariantesFrontend(rawVariants, preco, precoComparativo) {
       valor = '';
     }
 
-    // Ignorar vazios e duplicatas
-    if (!valor || vistos.has(valor)) continue;
-    vistos.add(valor);
+    // ✅ Ignorar vazios e duplicatas — comparação CASE-INSENSITIVE
+    const valorKey = valor.toLowerCase();
+    if (!valor || vistos.has(valorKey)) {
+      if (valor) console.warn(`[normalizarVariantesFrontend] ⚠️ Duplicata removida: "${valor}"`);
+      continue;
+    }
+    vistos.add(valorKey);
 
     // Montar variante no formato exato da API Nuvemshop
     const variante = {
@@ -21474,6 +21490,7 @@ function normalizarVariantesFrontend(rawVariants, preco, precoComparativo) {
     }];
   }
 
+  console.log('[normalizarVariantesFrontend] Tamanhos enviados:', resultado.map(v => v.values[0]));
   return resultado;
 }
 
@@ -21732,42 +21749,39 @@ async function publicarProduto(produto) {
     gerado.variants = ['P', 'M', 'G'];
   }
 
-  // Normalizar via função canônica — aceita strings, {option1}, {values:[]}
+  // ✅ UMA única normalização — evita dupla passagem que causava 422
+  // normalizarVariantesFrontend já garante: values[] sem duplicatas, sem option1, sem array-em-array
   const variantsNorm = normalizarVariantesFrontend(
     gerado.variants,
     gerado.price || gerado.preco,
     gerado.compare_at_price || gerado.preco_comparativo
   );
 
-  // ✅ CORREÇÃO DEFINITIVA: garantir values[] sem duplicação, sem array dentro de array
-  gerado.variants = variantsNorm.map(v => {
-    let valRaw = Array.isArray(v.values) ? v.values[0] : v.values;
-    if (Array.isArray(valRaw)) valRaw = valRaw[0]; // corrige [["P"]] → "P"
-    const valStr = String(valRaw || 'Unico').trim().toUpperCase();
-    return {
-      price:            String(v.price || gerado.price || gerado.preco || '0'),
-      stock:            v.stock ?? 100,
-      stock_management: true,
-      values:           [valStr],   // ✅ SEMPRE array de 1 string limpa, nunca duplicada
-      sku:              v.sku || `sku-${valStr.toLowerCase()}`,
-    };
-  });
+  gerado.variants = variantsNorm;
 
   // Criar options a partir dos values — OBRIGATÓRIO na Nuvemshop
+  // ✅ [...new Set()] garante options sem duplicatas mesmo se normalizarVariantesFrontend falhar
   const tamanhosPub = [...new Set(gerado.variants.map(v => v.values?.[0]).filter(Boolean))];
   gerado.options = [{ name: { pt: 'Tamanho' }, values: tamanhosPub }];
 
   // Remover campos legados
   delete gerado.option1; delete gerado.option2; delete gerado.option3;
 
-  // Verificar: não deve existir option1
+  // ── Diagnóstico final antes do envio ─────────────────────────────────
+  console.log('[publicarProduto] Tamanhos enviados:', tamanhosPub);
   if (JSON.stringify(gerado.variants).includes('"option1"')) {
     console.error('[publicarProduto] ⚠️ option1 ainda presente! Verificar normalizarVariantesFrontend.');
+  }
+  // Detectar duplicatas residuais
+  const valoresFinal = gerado.variants.map(v => v.values?.[0]);
+  const setFinal = new Set(valoresFinal);
+  if (setFinal.size !== valoresFinal.length) {
+    console.error('[publicarProduto] 🚨 DUPLICATA RESIDUAL detectada! Valores:', valoresFinal);
   }
 
   console.log('📦 FINAL PAYLOAD:', JSON.stringify({ options: gerado.options, variants: gerado.variants }, null, 2));
 
-  // ✅ Verificar duplicata e publicar via Vercel Functions (proxy server-side)
+  // ✅ Verificar duplicata de produto e publicar via Vercel Functions (proxy server-side)
   const existe = await pipVerificarExistencia(gerado.slug || slugificar(gerado.title || gerado.titulo || ''), token, storeId).catch(() => null);
   return pipPublicarNuvemshop(gerado, token, storeId, existe?.id);
 }
@@ -22120,35 +22134,59 @@ function agruparImagens(lista) {
 
 // ─── normalizarVariantesFinal() — CORREÇÃO DEFINITIVA ──────────────────────────
 // Garante: values[] sempre string limpa, sem duplicatas, sem array dentro de array
+// ⚠️  NÃO aplica toUpperCase — preserva capitalização original do input para
+//     evitar inconsistência com normalizarVariantesFrontend (que não faz uppercase).
 function normalizarVariantesFinal(variants, preco) {
   const precoStr = String(preco || '99.90').replace(',', '.');
   const seen = new Set();
-  return variants
+
+  // ── Diagnóstico: detectar duplicatas ANTES de remover ──────────────────
+  const contagem = {};
+  variants.forEach(v => {
+    let raw = v && (typeof v === 'object') ? (v.values ?? v.value ?? v.option1 ?? '') : v;
+    if (Array.isArray(raw)) raw = raw[0];
+    if (Array.isArray(raw)) raw = raw[0];
+    const chave = String(raw ?? '').trim().toLowerCase();
+    if (chave) contagem[chave] = (contagem[chave] || 0) + 1;
+  });
+  const duplicatas = Object.entries(contagem).filter(([, n]) => n > 1).map(([k]) => k);
+  if (duplicatas.length > 0) {
+    console.error('[normalizarVariantesFinal] 🚨 Duplicatas detectadas antes de limpar:', duplicatas);
+    console.error('[normalizarVariantesFinal] Input bruto:', JSON.stringify(variants));
+  }
+
+  const resultado = variants
     .map(v => {
       let valor = v && (typeof v === 'object') ? (v.values ?? v.value ?? v.option1 ?? '') : v;
       // Corrigir array dentro de array: [["P"]] → "P"
       if (Array.isArray(valor)) valor = valor[0];
       if (Array.isArray(valor)) valor = valor[0]; // dupla proteção
-      valor = String(valor ?? '').trim().toUpperCase();
+      // ✅ trim() apenas — SEM toUpperCase para manter consistência entre funções
+      valor = String(valor ?? '').trim();
       if (!valor) return null;
       return {
         price:            v && v.price ? String(v.price).replace(',', '.') : precoStr,
         stock:            (v && v.stock != null) ? (parseInt(v.stock) || 100) : 100,
         stock_management: true,
-        sku:              (v && v.sku) ? String(v.sku).trim() : `sku-${valor.toLowerCase()}`,
+        sku:              (v && v.sku) ? String(v.sku).trim() : `sku-${valor.toLowerCase().replace(/\s+/g, '-')}`,
         values:           [valor],   // ✅ SEMPRE ["STRING"] — nunca ["P","P"], nunca [["P"]]
       };
     })
     .filter(v => {
       if (!v) return false;
-      const key = v.values[0];
+      // Comparação case-insensitive para deduplicar, preservando capitalização original
+      const key = v.values[0].toLowerCase();
       if (seen.has(key)) {
-        console.warn('[normalizarVariantesFinal] Duplicata removida:', key);
+        console.warn('[normalizarVariantesFinal] ⚠️ Duplicata removida:', v.values[0]);
         return false;
       }
       seen.add(key);
       return true;
     });
+
+  // ── Log dos valores finais enviados ─────────────────────────────────────
+  console.log('[normalizarVariantesFinal] Tamanhos enviados:', resultado.map(v => v.values[0]));
+  return resultado;
 }
 
 // ─── 4. _cdnMontarProduto() — helper local ───────────────────────────────
