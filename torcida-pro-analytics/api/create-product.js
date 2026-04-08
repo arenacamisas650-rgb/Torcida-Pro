@@ -23,24 +23,48 @@ function dedupTags(tags) {
   return [...new Set(raw.split(',').map(t => t.trim()).filter(Boolean))].join(',');
 }
 
+// ── normVariants ──────────────────────────────────────────────────────────────
+// ✅ CORREÇÃO 1: removido .toUpperCase() que causava mismatch entre
+//    options.values e variants[].values → gerava 422 na Nuvemshop.
+// ✅ CORREÇÃO 2: deduplicação agora é case-insensitive (Set com lowercase).
+//    Antes: seen.has("G") não detectava "g" como duplicata.
 function normVariants(raw) {
-  const arr = Array.isArray(raw) && raw.length ? raw : [{ values: ['UNICO'], price: '0' }];
-  const seen = new Set();
-  const out  = [];
-  for (const v of arr) {
+  const arr = Array.isArray(raw) && raw.length ? raw : [{ values: ['Unico'], price: '0' }];
+
+  // Diagnóstico: logar duplicatas no input antes de processar
+  const inputVals = arr.map(v => {
     let val = v.values;
     if (Array.isArray(val)) val = val[0];
     if (Array.isArray(val)) val = val[0];
-    val = String(val || '').trim().toUpperCase();
-    if (!val || seen.has(val)) continue;
-    seen.add(val);
+    return String(val || '').trim();
+  }).filter(Boolean);
+  const inputSet = new Set(inputVals.map(s => s.toLowerCase()));
+  if (inputSet.size !== inputVals.length) {
+    console.error('[normVariants] 🚨 Duplicatas detectadas no input:', inputVals);
+  }
+
+  const seen = new Set(); // lowercase — deduplicação case-insensitive
+  const out  = [];
+
+  for (const v of arr) {
+    let val = v.values;
+    if (Array.isArray(val)) val = val[0];
+    if (Array.isArray(val)) val = val[0]; // dupla proteção contra [["P"]]
+    val = String(val || '').trim();       // ✅ SEM toUpperCase
+    const valKey = val.toLowerCase();
+    if (!val || seen.has(valKey)) {
+      if (val) console.warn('[normVariants] ⚠️ Duplicata removida:', val);
+      continue;
+    }
+    seen.add(valKey);
+
     const p = parseFloat(String(v.price || '0').replace(',', '.'));
     const item = {
       price:            (!isNaN(p) && p > 0) ? p.toFixed(2) : '0.00',
       stock:            parseInt(v.stock) || 100,
       stock_management: true,
-      sku:              v.sku || ('sku-' + val.toLowerCase()),
-      values:           [val],
+      sku:              v.sku || ('sku-' + valKey.replace(/\s+/g, '-')),
+      values:           [val], // ✅ capitalização original preservada
     };
     if (v.compare_at_price) {
       const c = parseFloat(String(v.compare_at_price).replace(',', '.'));
@@ -48,9 +72,13 @@ function normVariants(raw) {
     }
     out.push(item);
   }
-  return out.length
+
+  const resultado = out.length
     ? out
-    : [{ price: '0.00', stock: 100, stock_management: true, sku: 'sku-unico', values: ['UNICO'] }];
+    : [{ price: '0.00', stock: 100, stock_management: true, sku: 'sku-unico', values: ['Unico'] }];
+
+  console.log('[normVariants] Tamanhos finais:', resultado.map(v => v.values[0]));
+  return resultado;
 }
 
 function hdr(token) {
@@ -122,19 +150,22 @@ export default async function handler(req, res) {
 
   // ── Normalizar ──────────────────────────────────────────────────────────────
   const variants     = normVariants(produto.variants);
-  const optionValues = variants.map(v => v.values[0]);
+  const optionValues = [...new Set(variants.map(v => v.values[0]).filter(Boolean))];
   const nome         = str(produto.name || produto.title) || 'Produto';
   const desc         = str(produto.description || produto.body_html) || '';
   const handleRaw    = str(produto.handle || produto.slug) || nome.toLowerCase().replace(/[^a-z0-9]+/gi, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
   const handle       = handleRaw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9-]/g, '');
   const tags         = dedupTags(produto.tags);
 
+  // ✅ CORREÇÃO 3: options[].name como objeto { pt } — Nuvemshop exige multilíngue
+  //    Antes: options: [{ name: 'Tamanho', values: [...] }]  → ignorado ou erro silencioso
+  //    Depois: options: [{ name: { pt: 'Tamanho' }, values: [...] }]
   const payload = {
     name:        { pt: nome },
     description: { pt: desc },
     handle:      { pt: handle },
     published:   true,
-    options:     [{ name: 'Tamanho', values: optionValues }],
+    options:     [{ name: { pt: 'Tamanho' }, values: optionValues }],
     variants,
   };
   if (tags)                    payload.tags            = tags;
@@ -142,7 +173,19 @@ export default async function handler(req, res) {
   if (produto.seo_description) payload.seo_description = str(produto.seo_description);
 
   console.log('[CP] store=' + storeId + ' handle=' + handle);
-  console.log('[CP] variants=' + JSON.stringify(optionValues));
+  console.log('[CP] optionValues=' + JSON.stringify(optionValues));
+  console.log('[CP] variants=' + JSON.stringify(variants.map(v => v.values[0])));
+
+  // Segurança final: detectar duplicata residual antes de enviar
+  const valoresFinais = variants.map(v => v.values[0]);
+  const setFinal = new Set(valoresFinais.map(s => s.toLowerCase()));
+  if (setFinal.size !== valoresFinais.length) {
+    console.error('[CP] 🚨 DUPLICATA RESIDUAL detectada antes do POST!', valoresFinais);
+    return res.status(400).json({
+      error: 'Variantes duplicadas detectadas no servidor antes do envio',
+      valores: valoresFinais,
+    });
+  }
 
   // ── TENTATIVA 1: POST direto ────────────────────────────────────────────────
   console.log('[CP] Tentativa 1: POST direto...');
@@ -161,9 +204,28 @@ export default async function handler(req, res) {
     return res.status(200).json({ product_id: json.id, product: json });
   }
 
-  // ── TENTATIVA 2: 422 → deletar e recriar ───────────────────────────────────
+  // ── TENTATIVA 2: 422 → identificar causa → deletar e recriar ───────────────
   if (result.status === 422) {
-    console.log('[CP] 422 recebido — buscando produto com handle=' + handle);
+    let detail422;
+    try { detail422 = JSON.parse(result.text); } catch { detail422 = {}; }
+    const msg422 = JSON.stringify(detail422).toLowerCase();
+
+    // ✅ CORREÇÃO 4: diferenciar o tipo de 422
+    //    "variant values should not be repeated" → problema no payload, NÃO adianta deletar e recriar
+    //    outros 422 (handle duplicado, etc.) → tenta deletar e recriar
+    if (msg422.includes('variant') && msg422.includes('repeat')) {
+      console.error('[CP] 🚨 422 por VARIANTES DUPLICADAS — payload inválido, abortando sem deletar');
+      console.error('[CP] Valores enviados:', valoresFinais);
+      console.error('[CP] Detalhe API:', JSON.stringify(detail422));
+      return res.status(422).json({
+        error:        'Variantes duplicadas rejeitadas pela Nuvemshop',
+        detail:       detail422,
+        valores_enviados: valoresFinais,
+        payload_sent: payload,
+      });
+    }
+
+    console.log('[CP] 422 recebido (motivo: handle/outro) — buscando produto com handle=' + handle);
 
     const existente = await acharPorHandle(handle, storeId, token).catch(e => {
       console.warn('[CP] Erro ao buscar: ' + e.message); return null;
@@ -187,7 +249,8 @@ export default async function handler(req, res) {
         return res.status(200).json({ product_id: json.id, product: json });
       }
     } else {
-      console.warn('[CP] Produto não encontrado na busca — 422 por outro motivo');
+      console.warn('[CP] Produto não encontrado na busca — 422 por motivo desconhecido');
+      console.warn('[CP] Detalhe API:', JSON.stringify(detail422));
     }
   }
 
