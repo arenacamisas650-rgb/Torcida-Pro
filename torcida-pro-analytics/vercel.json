@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
+    }
+  ],
+  "functions": {
+    "api/create-product.js":  { "maxDuration": 30 },
+    "api/delete-products.js": { "maxDuration": 60 },
+    "api/get-products.js":    { "maxDuration": 15 },
+    "api/get-store.js":       { "maxDuration": 15 },
+    "api/update-product.js":  { "maxDuration": 30 },
+    "api/upload-image.js":    { "maxDuration": 30 },
+    "api/listar-cdn.js":      { "maxDuration": 15 },
+    "api/shopify-proxy.js":   { "maxDuration": 15 }
+  }
+}
